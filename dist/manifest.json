@@ -1,0 +1,20 @@
+{
+  "name": "Ring Ludo",
+  "short_name": "The Ultimate Ludo Battle Platform",
+  "start_url": "https://r1battel.com/",
+  "display": "standalone",
+  "background_color": "#ffffff",
+  "theme_color": "#ffffff",
+  "icons": [
+    {
+      "src": "logo.png",
+      "sizes": "192x192",
+      "type": "/newLogo.jpeg"
+    },
+    {
+      "src": "logo.png",
+      "sizes": "512x512",
+      "type": "/newLogo.jpeg"
+    }
+  ]
+}
