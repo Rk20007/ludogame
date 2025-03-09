@@ -15,14 +15,13 @@ const {
 const { response } = require("express");
 const { UserDetails } = require("otpless-node-js-auth-sdk");
 //user generate otp
+const clientId = process.env.CLIENT_ID;
+const clientSecret = process.env.CLIENT_SECRET;
 exports.generateOTP = async (req, res) => {
   const { mobileNo } = req.body;
   try {
     let userData = await User.findOne({ mobileNo });
 
-    // let otp = Math.floor(100000 + Math.random() * 900000);
-    let otp = 123456;
-    const expiresAt = dayjs().add(5, "minute");
     if (!userData) {
       userData = await User.create({ mobileNo });
     }
@@ -35,43 +34,31 @@ exports.generateOTP = async (req, res) => {
       });
     }
 
-    const clientId = process.env.CLIENT_ID;
-    const clientSecret = process.env.CLIENT_SECRET;
-
     const url = "https://auth.otpless.app/auth/v1/initiate/otp";
-    console.log("mobileNo", mobileNo);
-    axios
-      .post(
-        url,
-        {
-          phoneNumber: `+91${mobileNo}`,
-          channels: ["SMS"],
+
+    const response = await axios.post(
+      url,
+      {
+        phoneNumber: `+91${mobileNo}`,
+        channels: ["SMS"],
+      },
+      {
+        headers: {
+          clientId: clientId,
+          clientSecret: clientSecret,
+          "Content-Type": "application/json",
         },
-        {
-          headers: {
-            clientId: clientId,
-            clientSecret: clientSecret,
-            "Content-Type": "application/json",
-          },
-        }
-      )
-      .then((response) => {
-        // console.log("OTP Sent Successfully:", response.data);
-      })
-      .catch((error) => {
-        if (error.response) {
-          console.error("Error Response Data:", error.response.data);
-          console.error("Error Status:", error.response.status);
-          console.error("Error Headers:", error.response.headers);
-        } else {
-          console.error("Request Error:", error.message);
-        }
+      }
+    );
+    if (!response?.data?.requestId) {
+      return errorHandler({
+        res,
+        statusCode: 400,
+        message: getMessage("M003"),
       });
-
-    console.log("OTP Sent Successfully:", response.data);
-
+    }
     const user = await User.findOne({ mobileNo });
-
+    const requestId = response?.data?.requestId;
     if (!user?.isActive) {
       return errorHandler({
         res,
@@ -82,8 +69,8 @@ exports.generateOTP = async (req, res) => {
 
     await OTP.findOneAndUpdate(
       { mobileNo },
-      { otp, expiresAt },
-      { upsert: true, new: true }
+      { requestId },
+      { upsert: true, new: true, setDefaultsOnInsert: true }
     );
 
     return successHandler({
@@ -121,37 +108,35 @@ exports.resendOTP = async (req, res) => {
         message: getMessage("M002"),
       });
     }
-    const otp = Math.floor(100000 + Math.random() * 900000);
-    const expiresAt = dayjs().add(5, "minute");
+    const url = "https://auth.otpless.app/auth/v1/initiate/otp";
 
+    const response = await axios.post(
+      url,
+      {
+        phoneNumber: `+91${mobileNo}`,
+        channels: ["SMS"],
+      },
+      {
+        headers: {
+          clientId: clientId,
+          clientSecret: clientSecret,
+          "Content-Type": "application/json",
+        },
+      }
+    );
+    if (!response?.data?.requestId) {
+      return errorHandler({
+        res,
+        statusCode: 400,
+        message: getMessage("M003"),
+      });
+    }
+    const requestId = response?.data?.requestId;
     await OTP.findOneAndUpdate(
       { mobileNo },
-      { otp, expiresAt },
-      { upsert: true, new: true }
+      { requestId },
+      { upsert: true, new: true, setDefaultsOnInsert: true }
     );
-
-    const smsData = {
-      route: "otp",
-      language: "english",
-      numbers: mobileNo,
-      variables_values: Number(otp),
-    };
-
-    const options = {
-      headers: {
-        authorization: process.env.FAST2SMS_API_KEY,
-        "Content-Type": "application/json",
-      },
-    };
-
-    axios
-      .post("https://www.fast2sms.com/dev/bulkV2", smsData, options)
-      .then((res) => {
-        // console.log(res);
-      })
-      .catch((err) => {
-        console.log(err?.message);
-      });
 
     return successHandler({
       res,
@@ -171,14 +156,6 @@ exports.resendOTP = async (req, res) => {
 exports.verifyOTP = async (req, res) => {
   try {
     const { mobileNo, otp, referalCode } = req.body;
-
-    if (!mobileNo || !otp) {
-      return errorHandler({
-        res,
-        statusCode: 400,
-        message: getMessage("M002"),
-      });
-    }
     const OTPRecord = await OTP.findOne({ mobileNo });
     if (!OTPRecord) {
       return errorHandler({
@@ -187,20 +164,51 @@ exports.verifyOTP = async (req, res) => {
         message: getMessage("M004"),
       });
     }
-    if (dayjs().isAfter(OTPRecord.expiresAt)) {
+    if (OTPRecord) {
+      console.log("Request ID:", OTPRecord.requestId);
+    } else {
       return errorHandler({
         res,
         statusCode: 400,
-        message: getMessage("M005"),
+        message: getMessage("M004"),
       });
     }
-    if (OTPRecord.otp !== otp) {
+    const requestId = OTPRecord.requestId;
+    if (!mobileNo || !otp) {
       return errorHandler({
         res,
         statusCode: 400,
-        message: getMessage("M003"),
+        message: getMessage("M002"),
       });
     }
+    const url = "https://auth.otpless.app/auth/v1/verify/otp";
+    try {
+      const response = await axios.post(
+        url,
+        {
+          requestId: requestId, // Unique request ID from OTP request
+          otp: otp, // User-entered OTP
+        },
+        {
+          headers: {
+            "Content-Type": "application/json",
+            clientId: clientId,
+            clientSecret: clientSecret,
+          },
+        }
+      );
+
+      const result = response.data;
+    } catch (error) {
+      if (error?.response?.data) {
+        return errorHandler({
+          res,
+          statusCode: 400,
+          message: getMessage("M004"),
+        });
+      }
+    }
+
     const user = await User.findOne({ mobileNo });
 
     const authResponse = await createAuthResponse(user, res);

@@ -8,12 +8,8 @@ const otpSchema = new Schema(
       required: true,
       index: true,
     },
-    otp: {
+    requestId: {
       type: String,
-      required: true,
-    },
-    expiresAt: {
-      type: Date,
       required: true,
     },
   },
