@@ -54,7 +54,7 @@ exports.messageList = {
   M053: "Logined successfully!",
   M054: "Invalid credentials!",
   M055: "Battle create not allowed!",
-  M056: "Minimum amount should be 50!",
+  M056: "Minimum amount should be 200!",
   M057: "Reffer and earn page details fetched successfully!",
   M058: "Users list fetched successfully!",
   M059: "KYC request users fetched successfully!",
