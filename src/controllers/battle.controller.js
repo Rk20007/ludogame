@@ -21,7 +21,7 @@ exports.createBattle = async (req, res) => {
   try {
     const { _id, role } = req.user;
     const { amount } = req.body;
-    if (Number(amount) < 50) {
+    if (Number(amount) < 10) {
       return errorHandler({
         res,
         statusCode: 400,

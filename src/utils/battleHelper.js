@@ -40,7 +40,7 @@ const updateTransactionForStartingGame = async (userId, entryFee, battleId) => {
 };
 
 const isValidAmount = (amount) => {
-  return amount > 0 && amount % 50 === 0;
+  return amount > 0 && amount % 10 === 0;
 };
 
 const updateWinningAmountForWinner = async (data) => {

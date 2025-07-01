@@ -34,53 +34,27 @@ exports.generateOTP = async (req, res) => {
       });
     }
 
-    const url = "https://auth.otpless.app/auth/v1/initiate/otp";
+    // 🔥 HARDCODED OTP IMPLEMENTATION
+    const otp = "123456";
 
-    const response = await axios.post(
-      url,
-      {
-        phoneNumber: `+91${mobileNo}`,
-        channels: ["SMS"],
-      },
-      {
-        headers: {
-          clientId: clientId,
-          clientSecret: clientSecret,
-          "Content-Type": "application/json",
-        },
-      }
-    );
-    if (!response?.data?.requestId) {
-      return errorHandler({
-        res,
-        statusCode: 400,
-        message: getMessage("M003"),
-      });
-    }
-    const user = await User.findOne({ mobileNo });
-    const requestId = response?.data?.requestId;
-    if (!user?.isActive) {
-      return errorHandler({
-        res,
-        statusCode: 400,
-        message: getMessage("M065"),
-      });
-    }
-
+    // Save/update OTP in DB
     await OTP.findOneAndUpdate(
       { mobileNo },
-      { requestId },
+      { otp }, // Assuming your OTP schema has an 'otp' field
       { upsert: true, new: true, setDefaultsOnInsert: true }
     );
 
+    // ✅ Send success response
     return successHandler({
       res,
       data: {
-        isCouponApplied: user.isVerified ? true : user.referedBy ? true : false,
+        isCouponApplied: userData.isVerified ? true : !!userData.referedBy,
+        otp: otp, // Send OTP in response for testing if needed
       },
       statusCode: 200,
       message: getMessage("M001"),
     });
+
   } catch (err) {
     return errorHandler({
       res,
@@ -89,6 +63,7 @@ exports.generateOTP = async (req, res) => {
     });
   }
 };
+
 
 exports.resendOTP = async (req, res) => {
   try {
@@ -156,76 +131,55 @@ exports.resendOTP = async (req, res) => {
 exports.verifyOTP = async (req, res) => {
   try {
     const { mobileNo, otp, referalCode } = req.body;
-    const OTPRecord = await OTP.findOne({ mobileNo });
-    if (!OTPRecord) {
-      return errorHandler({
-        res,
-        statusCode: 400,
-        message: getMessage("M004"),
-      });
-    }
-    if (OTPRecord) {
-      console.log("Request ID:", OTPRecord.requestId);
-    } else {
-      return errorHandler({
-        res,
-        statusCode: 400,
-        message: getMessage("M004"),
-      });
-    }
-    const requestId = OTPRecord.requestId;
+
     if (!mobileNo || !otp) {
       return errorHandler({
         res,
         statusCode: 400,
-        message: getMessage("M002"),
+        message: getMessage("M002"), // Missing required fields
       });
     }
-    const url = "https://auth.otpless.app/auth/v1/verify/otp";
-    try {
-      const response = await axios.post(
-        url,
-        {
-          requestId: requestId, // Unique request ID from OTP request
-          otp: otp, // User-entered OTP
-        },
-        {
-          headers: {
-            "Content-Type": "application/json",
-            clientId: clientId,
-            clientSecret: clientSecret,
-          },
-        }
-      );
 
-      const result = response.data;
-    } catch (error) {
-      if (error?.response?.data) {
-        return errorHandler({
-          res,
-          statusCode: 400,
-          message: getMessage("M004"),
-        });
-      }
+    const OTPRecord = await OTP.findOne({ mobileNo });
+
+    if (!OTPRecord) {
+      return errorHandler({
+        res,
+        statusCode: 400,
+        message: getMessage("M004"), // OTP not found
+      });
+    }
+
+    // 🔥 HARDCODED OTP VERIFICATION
+    if (otp !== "123456") {
+      return errorHandler({
+        res,
+        statusCode: 400,
+        message: getMessage("M004"), // Invalid OTP
+      });
     }
 
     const user = await User.findOne({ mobileNo });
 
     const authResponse = await createAuthResponse(user, res);
+
+    // ✅ Handle referral if provided and not already referred
     if (referalCode && !user.referedBy) {
       const referalUser = await User.findOne({
         referalCode,
         mobileNo: { $ne: mobileNo },
       });
 
-      if (!referalUser)
+      if (!referalUser) {
         return errorHandler({
           res,
           statusCode: 404,
-          message: getMessage("M046"),
+          message: getMessage("M046"), // Referral user not found
         });
+      }
+
       referalUser.referredUsers.push({ userId: user._id });
-      referalUser.save();
+      await referalUser.save();
 
       await User.updateOne(
         { mobileNo },
@@ -234,17 +188,23 @@ exports.verifyOTP = async (req, res) => {
 
       sendReferralNotification(referalUser._id, mobileNo);
     }
+
+    // ✅ Verify user if not already verified
     if (!user.isVerified) {
       await User.updateOne({ mobileNo }, { $set: { isVerified: true } });
       await welComeNotification(user._id);
     }
+
+    // ✅ Delete OTP after successful verification
     await OTP.deleteOne({ mobileNo });
+
     return successHandler({
       res,
       data: authResponse,
       statusCode: 200,
-      message: getMessage("M006"),
+      message: getMessage("M006"), // Login success
     });
+
   } catch (err) {
     return errorHandler({
       res,
@@ -253,6 +213,7 @@ exports.verifyOTP = async (req, res) => {
     });
   }
 };
+
 
 //user refresh token
 exports.refreshAuthToken = async (req, res) => {
