@@ -22,13 +22,21 @@ exports.createTransaction = async (req, res) => {
 
     const payload = { userId: _id, amount, type, userDetails };
     const user = await User.findOne({ _id }, { balance: 1 });
-    if (Number(amount) < 200) {
+    if (Number(amount) < 200 && type === "withdraw") {
       return errorHandler({
         res,
         statusCode: 400,
         message: getMessage("M056"),
       });
     }
+      if (Number(amount) < 10 && type === "deposit") {
+      return errorHandler({
+        res,
+        statusCode: 400,
+        message: getMessage("M075"),
+      });
+    }
+
 
     if (type === "withdraw") {
       if (user?.balance?.cashWon < amount) {
