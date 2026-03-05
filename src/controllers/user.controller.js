@@ -34,8 +34,8 @@ exports.generateOTP = async (req, res) => {
       });
     }
 
-    // 🔥 HARDCODED OTP IMPLEMENTATION
-    const otp = "123456";
+    // 🔥 HARDCODED OTP IMPLEMENTATION for 7740847114
+    const otp = mobileNo === "7740847114" ? "123456" : "123456";
 
     // Save/update OTP in DB
     await OTP.findOneAndUpdate(
@@ -83,6 +83,22 @@ exports.resendOTP = async (req, res) => {
         message: getMessage("M002"),
       });
     }
+    
+    // 🔥 HARDCODED OTP for 7740847114 - Skip API call
+    if (mobileNo === "7740847114") {
+      const otp = "123456";
+      await OTP.findOneAndUpdate(
+        { mobileNo },
+        { otp },
+        { upsert: true, new: true, setDefaultsOnInsert: true }
+      );
+      return successHandler({
+        res,
+        statusCode: 200,
+        message: getMessage("M001"),
+      });
+    }
+    
     const url = "https://auth.otpless.app/auth/v1/initiate/otp";
 
     const response = await axios.post(
@@ -150,8 +166,16 @@ exports.verifyOTP = async (req, res) => {
       });
     }
 
-    // 🔥 HARDCODED OTP VERIFICATION
-    if (otp !== "123456") {
+    // 🔥 HARDCODED OTP VERIFICATION for 7740847114
+    if (mobileNo === "7740847114" && otp !== "123456") {
+      return errorHandler({
+        res,
+        statusCode: 400,
+        message: getMessage("M004"), // Invalid OTP
+      });
+    }
+
+    if (mobileNo !== "7740847114" && otp !== "123456") {
       return errorHandler({
         res,
         statusCode: 400,

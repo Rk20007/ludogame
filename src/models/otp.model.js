@@ -8,9 +8,13 @@ const otpSchema = new Schema(
       required: true,
       index: true,
     },
+    otp: {
+      type: String,
+      default: null,
+    },
     requestId: {
       type: String,
-      required: true,
+      default: null,
     },
   },
   {
