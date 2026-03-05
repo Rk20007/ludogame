@@ -2,9 +2,11 @@
   "name": "ludo-game",
   "version": "1.0.0",
   "main": "index.js",
-  "scripts": {
-    "start": "nodemon index.js"
-  },
+"scripts": {
+  "start": "node index.js",
+  "dev": "nodemon index.js",
+  "build": "echo \"No build step required\""
+},
   "author": "",
   "license": "ISC",
   "description": "",
