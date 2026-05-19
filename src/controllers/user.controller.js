@@ -12,14 +12,32 @@ const {
   welComeNotification,
   sendReferralNotification,
 } = require("../utils/notificationHelper");
+const { sendOTPViaSMS } = require("../utils/smsHelper");
 const { response } = require("express");
 const { UserDetails } = require("otpless-node-js-auth-sdk");
 //user generate otp
 const clientId = process.env.CLIENT_ID;
 const clientSecret = process.env.CLIENT_SECRET;
+
+/**
+ * Generate a random 6-digit OTP
+ * @returns {string} - 6-digit OTP code
+ */
+const generateRandomOTP = () => {
+  return Math.floor(100000 + Math.random() * 900000).toString();
+};
 exports.generateOTP = async (req, res) => {
   const { mobileNo } = req.body;
   try {
+    // Validate phone number
+    if (!mobileNo) {
+      return errorHandler({
+        res,
+        statusCode: 400,
+        message: getMessage("M002"),
+      });
+    }
+
     let userData = await User.findOne({ mobileNo });
 
     if (!userData) {
@@ -34,13 +52,24 @@ exports.generateOTP = async (req, res) => {
       });
     }
 
-    // 🔥 HARDCODED OTP IMPLEMENTATION for 7740847114
-    const otp = mobileNo === "7740847114" ? "123456" : "123456";
+    // Generate a random 6-digit OTP
+    const otp = generateRandomOTP();
+
+    // Send OTP via SMS
+    const smsSent = await sendOTPViaSMS(mobileNo, otp);
+
+    if (!smsSent) {
+      return errorHandler({
+        res,
+        statusCode: 500,
+        message: "Failed to send OTP. Please try again later.",
+      });
+    }
 
     // Save/update OTP in DB
     await OTP.findOneAndUpdate(
       { mobileNo },
-      { otp }, // Assuming your OTP schema has an 'otp' field
+      { otp },
       { upsert: true, new: true, setDefaultsOnInsert: true }
     );
 
@@ -49,13 +78,14 @@ exports.generateOTP = async (req, res) => {
       res,
       data: {
         isCouponApplied: userData.isVerified ? true : !!userData.referedBy,
-        otp: otp, // Send OTP in response for testing if needed
+        message: "OTP sent successfully to your mobile number",
       },
       statusCode: 200,
       message: getMessage("M001"),
     });
 
   } catch (err) {
+    console.error("generateOTP error:", err);
     return errorHandler({
       res,
       statusCode: 500,
@@ -83,49 +113,25 @@ exports.resendOTP = async (req, res) => {
         message: getMessage("M002"),
       });
     }
-    
-    // 🔥 HARDCODED OTP for 7740847114 - Skip API call
-    if (mobileNo === "7740847114") {
-      const otp = "123456";
-      await OTP.findOneAndUpdate(
-        { mobileNo },
-        { otp },
-        { upsert: true, new: true, setDefaultsOnInsert: true }
-      );
-      return successHandler({
-        res,
-        statusCode: 200,
-        message: getMessage("M001"),
-      });
-    }
-    
-    const url = "https://auth.otpless.app/auth/v1/initiate/otp";
 
-    const response = await axios.post(
-      url,
-      {
-        phoneNumber: `+91${mobileNo}`,
-        channels: ["SMS"],
-      },
-      {
-        headers: {
-          clientId: clientId,
-          clientSecret: clientSecret,
-          "Content-Type": "application/json",
-        },
-      }
-    );
-    if (!response?.data?.requestId) {
+    // Generate a new random OTP
+    const otp = generateRandomOTP();
+
+    // Send OTP via Renflair SMS service
+    const smsSent = await sendOTPViaSMS(mobileNo, otp);
+
+    if (!smsSent) {
       return errorHandler({
         res,
-        statusCode: 400,
-        message: getMessage("M003"),
+        statusCode: 500,
+        message: "Failed to send OTP. Please try again later.",
       });
     }
-    const requestId = response?.data?.requestId;
+
+    // Save/update OTP in DB
     await OTP.findOneAndUpdate(
       { mobileNo },
-      { requestId },
+      { otp },
       { upsert: true, new: true, setDefaultsOnInsert: true }
     );
 
@@ -135,6 +141,7 @@ exports.resendOTP = async (req, res) => {
       message: getMessage("M001"),
     });
   } catch (err) {
+    console.error("resendOTP error:", err);
     return errorHandler({
       res,
       statusCode: 500,
@@ -166,16 +173,8 @@ exports.verifyOTP = async (req, res) => {
       });
     }
 
-    // 🔥 HARDCODED OTP VERIFICATION for 7740847114
-    if (mobileNo === "7740847114" && otp !== "123456") {
-      return errorHandler({
-        res,
-        statusCode: 400,
-        message: getMessage("M004"), // Invalid OTP
-      });
-    }
-
-    if (mobileNo !== "7740847114" && otp !== "123456") {
+    // Verify OTP matches the stored OTP
+    if (OTPRecord.otp !== otp) {
       return errorHandler({
         res,
         statusCode: 400,

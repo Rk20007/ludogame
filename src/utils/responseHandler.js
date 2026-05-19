@@ -16,3 +16,4 @@ const successHandler = ({ res, data = null, statusCode, message }) => {
 };
 
 module.exports = { errorHandler, successHandler };
+ 

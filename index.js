@@ -9,6 +9,7 @@ const transactionRouter = require("./src/routes/transactions.routes");
 const settingsRouter = require("./src/routes/settings.routes");
 const notificationRouter = require("./src/routes/notification.routes");
 const battleRouter = require("./src/routes/battle.routes");
+const paymentRoutes = require("./src/routes/paymentRoutes");
 const specs = require("./src/docs/swagger");
 require("./src/cron");
 const PORT = process.env.PORT || 8000;
@@ -22,6 +23,8 @@ app.use("/api/v1/transaction", transactionRouter);
 app.use("/api/v1/admin", settingsRouter);
 app.use("/api/v1/notification", notificationRouter);
 app.use("/api/v1/battle", battleRouter);
+app.use("/api/payment", paymentRoutes);
+app.use("/api/transaction/wallet", paymentRoutes.webhookRouter);
 
 app.get("/", (req, res) => {
   // res.send("server is running");

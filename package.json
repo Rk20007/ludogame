@@ -2,12 +2,15 @@
   "name": "ludo-game",
   "version": "1.0.0",
   "main": "index.js",
-"scripts": {
-  "start": "node index.js",
-  "dev": "nodemon index.js",
-  "build": "npm install --production",
-  "prod": "NODE_ENV=production node index.js"
-},
+  "scripts": {
+    "start": "node index.js",
+    "dev": "nodemon index.js",
+    "build": "npm install --production",
+    "prod": "NODE_ENV=production node index.js",
+    "next:dev": "next dev",
+    "next:build": "next build",
+    "next:start": "next start"
+  },
   "author": "",
   "license": "ISC",
   "description": "",
@@ -24,9 +27,12 @@
     "joi": "^17.13.3",
     "jsonwebtoken": "^9.0.2",
     "mongoose": "^8.8.4",
+    "next": "^15.5.0",
     "node-cron": "^3.0.3",
     "nodemon": "^3.1.9",
     "otpless-node-js-auth-sdk": "^1.0.8",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
     "swagger-jsdoc": "^6.2.8",
     "swagger-ui-express": "^5.0.1",
     "uuid": "^11.0.3"

@@ -1,0 +1,532 @@
+const axios = require("axios");
+const mongoose = require("mongoose");
+const { v4: uuidv4 } = require("uuid");
+
+const User = require("../models/user.model");
+const { GatewayPayment } = require("../models/gatewayPayment.model");
+const { errorHandler, successHandler } = require("../utils/responseHandler");
+const {
+  getEkqrApiKey,
+  getCreateOrderUrl,
+  getCheckOrderUrl,
+  getDefaultRedirectUrl,
+  ekqrPost,
+  extractCreateOrder,
+  extractEkqrUpstreamMessage,
+  extractCheckOrder,
+  normalizeStatus,
+  isGatewaySuccess,
+} = require("../utils/ekqrGateway.helper");
+const {
+  validateEkqrWebhookKey,
+  stringifyWebhookPayload,
+  markGatewayPaymentFailed,
+  finalizeSuccessfulGatewayPayment,
+} = require("../utils/gatewayPaymentWallet.service");
+
+function parsePositiveAmount(raw) {
+  if (raw === undefined || raw === null || raw === "") return null;
+  const n = Number.parseFloat(String(raw));
+  if (!Number.isFinite(n) || n <= 0) return null;
+  return n;
+}
+
+function validateTxnDate(s) {
+  const t =
+    typeof s === "string" ? s.trim() : s === undefined ? "" : String(s).trim();
+  if (!t) return null;
+  if (!/^\d{2}-\d{2}-\d{4}$/.test(t)) return null;
+  return t;
+}
+
+function sanitizeString(v) {
+  if (typeof v !== "string") return "";
+  return v.trim();
+}
+
+/**
+ * POST /api/payment/create-order
+ */
+const createOrder = async (req, res) => {
+  console.log("[EKQR] create-order");
+  try {
+    const apiKey = getEkqrApiKey();
+    if (!apiKey) {
+      console.error("[EKQR] Missing EKQR_API_KEY / UPI_WEBHOOK_SECRET");
+      return errorHandler({
+        res,
+        statusCode: 500,
+        message: "Gateway key not configured on server",
+      });
+    }
+
+    const {
+      amount,
+      customer_name,
+      customer_email,
+      customer_mobile,
+      p_info,
+      userId,
+      redirect_url,
+      udf1,
+      udf2,
+      udf3,
+    } = req.body || {};
+
+    const amountNum = parsePositiveAmount(amount);
+
+    const cName = sanitizeString(customer_name);
+    const cEmail = sanitizeString(customer_email);
+    const cMobile = sanitizeString(customer_mobile);
+    const pInfo = sanitizeString(p_info || "");
+
+    if (amountNum === null) {
+      return errorHandler({
+        res,
+        statusCode: 400,
+        message: "amount must be a positive number",
+      });
+    }
+
+    if (!cName || !cEmail || !cMobile || !pInfo) {
+      return errorHandler({
+        res,
+        statusCode: 400,
+        message:
+          "customer_name, customer_email, customer_mobile and p_info are required",
+      });
+    }
+
+    const normalizedUserId = sanitizeString(userId);
+    if (!normalizedUserId || !mongoose.Types.ObjectId.isValid(normalizedUserId)) {
+      return errorHandler({
+        res,
+        statusCode: 400,
+        message: "userId must be a valid ObjectId string",
+      });
+    }
+
+    const tokenUid = sanitizeString(req.user && req.user._id);
+    if (
+      tokenUid &&
+      normalizedUserId &&
+      tokenUid !== normalizedUserId &&
+      req.user.role !== "admin"
+    ) {
+      return errorHandler({
+        res,
+        statusCode: 403,
+        message: "Forbidden: userId does not match authenticated user",
+      });
+    }
+
+    const userExists = await User.exists({
+      _id: normalizedUserId,
+      isActive: true,
+    });
+    if (!userExists) {
+      return errorHandler({
+        res,
+        statusCode: 404,
+        message: "User not found or inactive",
+      });
+    }
+
+    const client_txn_id = `${Date.now()}${uuidv4().replace(/-/g, "").slice(0, 12)}`;
+    const redir =
+      typeof redirect_url === "string" && redirect_url.trim()
+        ? redirect_url.trim()
+        : getDefaultRedirectUrl();
+
+    const gp = await GatewayPayment.create({
+      userId: normalizedUserId,
+      amount: amountNum,
+      client_txn_id,
+      status: "pending",
+      p_info: pInfo,
+      payment_url: null,
+      order_id: null,
+      rawResponse: null,
+      webhookPayload: null,
+      walletCredited: false,
+    });
+
+    const udfWallet =
+      typeof udf1 === "string" && udf1.trim() ? udf1.trim() : "wallet";
+    const udfUser =
+      typeof udf2 === "string" && udf2.trim() ? udf2.trim() : normalizedUserId;
+    const udfExtra =
+      typeof udf3 === "string" && udf3.trim() ? udf3.trim() : "custom";
+
+    const payload = {
+      key: apiKey,
+      client_txn_id,
+      amount: String(amountNum),
+      p_info: pInfo,
+      customer_name: cName,
+      customer_email: cEmail,
+      customer_mobile: cMobile,
+      redirect_url: redir,
+      udf1: udfWallet,
+      udf2: udfUser,
+      udf3: udfExtra,
+    };
+
+    let upstream;
+    try {
+      upstream = await ekqrPost(getCreateOrderUrl(), payload);
+    } catch (err) {
+      console.error("[EKQR] create_order upstream error:", err?.message ?? err);
+
+      /** @type {unknown} */
+      let details = err && axios.isAxiosError(err) ? err.response?.data : undefined;
+      await GatewayPayment.findByIdAndUpdate(gp._id, {
+        status: "failed",
+        failureReason: "create_order_upstream_error",
+        rawResponse:
+          err && axios.isAxiosError(err)
+            ? { message: err.message, upstream: details ?? null }
+            : { message: String(err) },
+      }).catch(() => {});
+
+      return errorHandler({
+        res,
+        statusCode: 502,
+        message: "Upstream create_order failed",
+      });
+    }
+
+    const { payment_url, order_id } = extractCreateOrder(upstream.data);
+
+    if (!payment_url) {
+      console.error("[EKQR] create_order missing payment_url", upstream?.data);
+      await GatewayPayment.findByIdAndUpdate(gp._id, {
+        status: "failed",
+        failureReason: "missing_payment_url",
+        rawResponse: upstream?.data ?? null,
+      }).catch(() => {});
+
+      const upstreamMsg = extractEkqrUpstreamMessage(upstream?.data);
+      return errorHandler({
+        res,
+        statusCode: 502,
+        message:
+          upstreamMsg ||
+          "Invalid upstream response — payment_url missing",
+      });
+    }
+
+    await GatewayPayment.findByIdAndUpdate(gp._id, {
+      payment_url,
+      order_id,
+      rawResponse: upstream?.data ?? null,
+    });
+
+    console.log("[EKQR] create-order ok", client_txn_id);
+
+    return successHandler({
+      res,
+      statusCode: 201,
+      message: "Payment order created",
+      data: { payment_url, order_id, client_txn_id },
+    });
+  } catch (e) {
+    console.error("[EKQR] create-order error:", e);
+    return errorHandler({
+      res,
+      statusCode: 500,
+      message: "Internal server error",
+    });
+  }
+};
+
+/**
+ * POST /api/payment/check-status
+ */
+const checkOrderStatus = async (req, res) => {
+  console.log("[EKQR] check-status");
+  try {
+    const apiKey = getEkqrApiKey();
+    if (!apiKey) {
+      console.error("[EKQR] Missing EKQR_API_KEY / UPI_WEBHOOK_SECRET");
+      return errorHandler({
+        res,
+        statusCode: 500,
+        message: "Gateway key not configured on server",
+      });
+    }
+
+    const client_txn_id = sanitizeString((req.body && req.body.client_txn_id) || "");
+    const txn_date = validateTxnDate((req.body && req.body.txn_date) || "");
+
+    if (!client_txn_id) {
+      return errorHandler({
+        res,
+        statusCode: 400,
+        message: "client_txn_id is required",
+      });
+    }
+
+    if (!txn_date) {
+      return errorHandler({
+        res,
+        statusCode: 400,
+        message: "txn_date is required in DD-MM-YYYY format",
+      });
+    }
+
+    const gp = await GatewayPayment.findOne({ client_txn_id }).lean();
+
+    if (!gp) {
+      return errorHandler({
+        res,
+        statusCode: 404,
+        message: "Unknown client_txn_id",
+      });
+    }
+
+    const tokenUid = sanitizeString(req.user && req.user._id);
+    const gpUser = gp.userId && gp.userId.toString();
+
+    if (
+      tokenUid &&
+      gpUser &&
+      gpUser !== tokenUid &&
+      req.user.role !== "admin"
+    ) {
+      return errorHandler({
+        res,
+        statusCode: 403,
+        message: "Forbidden: cannot inspect another user's payment",
+      });
+    }
+
+    const payload = { key: apiKey, client_txn_id, txn_date };
+
+    let upstream;
+    try {
+      upstream = await ekqrPost(getCheckOrderUrl(), payload);
+    } catch (err) {
+      console.error("[EKQR] check_order_status upstream:", err?.message ?? err);
+
+      /** @type {unknown} */
+      let details = err && axios.isAxiosError(err) ? err.response?.data : undefined;
+
+      await GatewayPayment.findOneAndUpdate(
+        { client_txn_id },
+        {
+          failureReason: "check_order_upstream_error",
+          rawResponse:
+            err && axios.isAxiosError(err)
+              ? {
+                  previousRaw: gp.rawResponse ?? null,
+                  error: details ?? err.message ?? null,
+                }
+              : { previousRaw: gp.rawResponse ?? null, error: String(err) },
+        }
+      ).catch(() => {});
+
+      return errorHandler({
+        res,
+        statusCode: 502,
+        message: "Upstream check_order_status failed",
+      });
+    }
+
+    const extracted = extractCheckOrder(upstream.data);
+
+    await GatewayPayment.findOneAndUpdate(
+      { client_txn_id },
+      {
+        rawResponse: upstream.data ?? null,
+        txn_date,
+        ...(extracted.order_id ? { order_id: extracted.order_id } : {}),
+        ...(extracted.txn_id ? { txn_id: extracted.txn_id } : {}),
+      }
+    ).catch(() => {});
+
+    if (isGatewaySuccess(extracted.status)) {
+      const gwTxn =
+        (extracted.txn_id && String(extracted.txn_id).trim()) ||
+        (gp.txn_id && String(gp.txn_id).trim()) ||
+        "";
+
+      if (!gwTxn) {
+        console.error("[EKQR] success without txn_id:", upstream?.data);
+        await markGatewayPaymentFailed({
+          gatewayPaymentId: gp._id,
+          webhookPayload: { check_order: upstream.data },
+          reason: "check_status_missing_txn_id",
+        }).catch(() => {});
+
+        return successHandler({
+          res,
+          statusCode: 200,
+          message: "Gateway indicates success but txn_id missing — not credited",
+          data: {
+            client_txn_id,
+            reconciliation: "failed",
+            upstream: upstream.data,
+          },
+        });
+      }
+
+      const outcome = await finalizeSuccessfulGatewayPayment({
+        userId: gp.userId,
+        gatewayPaymentId: gp._id,
+        client_txn_id,
+        gatewayTxnId: gwTxn,
+        webhookPayload: { check_order: upstream.data },
+        sourceTag: "[check_status]",
+      });
+
+      console.log("[EKQR] check-status outcome:", outcome);
+
+      const refreshed = await GatewayPayment.findOne({ client_txn_id }).lean();
+
+      return successHandler({
+        res,
+        statusCode: 200,
+        message: "Payment status processed",
+        data: {
+          client_txn_id,
+          reconciliation: outcome,
+          txn_id: refreshed?.txn_id,
+          gatewayStatus: extracted.status,
+        },
+      });
+    }
+
+    await markGatewayPaymentFailed({
+      gatewayPaymentId: gp._id,
+      webhookPayload: { check_order: upstream.data },
+      reason: "check_status_gateway_not_success",
+    }).catch(() => {});
+
+    console.log("[EKQR] check-status gateway not successful");
+
+    return successHandler({
+      res,
+      statusCode: 200,
+      message: "Payment not successful according to gateway",
+      data: {
+        client_txn_id,
+        reconciliation: "failed",
+        gatewayStatus: extracted.status,
+      },
+    });
+  } catch (e) {
+    console.error("[EKQR] check-status error:", e);
+    return errorHandler({
+      res,
+      statusCode: 500,
+      message: "Internal server error",
+    });
+  }
+};
+
+/**
+ * POST /api/transaction/wallet/verify/upi
+ * Content-Type: application/x-www-form-urlencoded (parsed via express.urlencoded)
+ */
+const upiWebhook = async (req, res) => {
+  console.log("Webhook Received");
+
+  try {
+    const rawBody = stringifyWebhookPayload(
+      req.body && typeof req.body === "object" ? req.body : {}
+    );
+
+    console.log("[EKQR Webhook] Full payload:", JSON.stringify(rawBody));
+
+    const secret = validateEkqrWebhookKey(req, "[EKQR Webhook]");
+    if (!secret.ok) {
+      return res.status(401).json({ success: false, error: "Unauthorized" });
+    }
+
+    const txn_id = sanitizeString(rawBody.txn_id);
+    const client_txn_id = sanitizeString(rawBody.client_txn_id);
+    const amountNum = parsePositiveAmount(rawBody.amount);
+    const statusRaw =
+      typeof rawBody.status !== "undefined" && rawBody.status !== null
+        ? rawBody.status
+        : "";
+
+    if (!txn_id) {
+      console.error("[EKQR Webhook] missing txn_id");
+      return res.status(400).json({ success: false, error: "txn_id required" });
+    }
+
+    if (!client_txn_id) {
+      console.error("[EKQR Webhook] missing client_txn_id");
+      return res
+        .status(400)
+        .json({ success: false, error: "client_txn_id required" });
+    }
+
+    if (amountNum === null) {
+      console.error("[EKQR Webhook] invalid amount");
+      return res.status(400).json({ success: false, error: "invalid amount" });
+    }
+
+    if (!String(statusRaw).trim()) {
+      console.error("[EKQR Webhook] missing status");
+      return res.status(400).json({ success: false, error: "status required" });
+    }
+
+    const gp = await GatewayPayment.findOne({ client_txn_id });
+    if (!gp) {
+      console.error("[EKQR Webhook] unknown client_txn_id");
+      return res.status(404).json({ success: false, error: "Unknown transaction" });
+    }
+
+    if (
+      typeof gp.amount === "number" &&
+      Math.abs(gp.amount - amountNum) > 0.015
+    ) {
+      console.warn(
+        `[EKQR Webhook] amount mismatch webhook=${amountNum} stored=${gp.amount} — credits use stored doc`
+      );
+    }
+
+    await GatewayPayment.findByIdAndUpdate(gp._id, {
+      webhookPayload: rawBody,
+      txn_id,
+    }).catch(() => {});
+
+    if (!isGatewaySuccess(statusRaw)) {
+      await markGatewayPaymentFailed({
+        gatewayPaymentId: gp._id,
+        webhookPayload: rawBody,
+        reason: "webhook_not_success_status",
+      }).catch(() => {});
+
+      console.log("Payment Failed");
+      return res.status(200).json({ success: true });
+    }
+
+    const outcome = await finalizeSuccessfulGatewayPayment({
+      userId: gp.userId,
+      gatewayPaymentId: gp._id,
+      client_txn_id,
+      gatewayTxnId: txn_id,
+      webhookPayload: rawBody,
+      sourceTag: "[webhook]",
+    });
+
+    if (outcome === "duplicate") console.log("Duplicate Transaction");
+    else if (outcome === "credited") console.log("Payment Success");
+    else console.log("Payment Failed");
+
+    return res.status(200).json({ success: true });
+  } catch (e) {
+    console.error("[EKQR Webhook] unhandled:", e);
+    return res.status(200).json({ success: true });
+  }
+};
+
+module.exports = {
+  createOrder,
+  checkOrderStatus,
+  upiWebhook,
+};
