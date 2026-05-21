@@ -1,5 +1,6 @@
 const mongoose = require("mongoose");
 const User = require("../models/user.model");
+const Transaction = require("../models/transaction.model");
 const { GatewayPayment } = require("../models/gatewayPayment.model");
 const Wallet = require("../models/gatewayWallet.model");
 const GatewayPaymentIdempotency = require("../models/gatewayPaymentIdempotency.model");
@@ -56,6 +57,52 @@ function stringifyWebhookPayload(body) {
     else out[k] = String(v);
   });
   return out;
+}
+
+/**
+ * Admin + user history: one approved deposit row per gateway payment.
+ */
+async function createGatewayDepositTransaction({
+  userAfter,
+  creditAmount,
+  gatewayPaymentId,
+  gatewayTxnId,
+  client_txn_id,
+  session,
+}) {
+  if (!userAfter || !gatewayPaymentId) return;
+
+  const exists = await Transaction.findOne({ gatewayPaymentId })
+    .session(session)
+    .lean();
+  if (exists) return;
+
+  const mobile =
+    typeof userAfter.mobileNo === "string" && userAfter.mobileNo.trim()
+      ? userAfter.mobileNo.trim()
+      : "0000000000";
+
+  await Transaction.create(
+    [
+      {
+        userId: userAfter._id,
+        type: "deposit",
+        amount: creditAmount,
+        status: "approved",
+        isGatewayDeposit: true,
+        gatewayPaymentId,
+        gatewayClientTxnId: client_txn_id || undefined,
+        utrNo: gatewayTxnId,
+        paymentMethod: "upi",
+        userDetails: {
+          name: userAfter.name || "User",
+          mobileNo: mobile,
+        },
+        closingBalance: userAfter.balance?.totalWalletBalance ?? 0,
+      },
+    ],
+    { session, ordered: true }
+  );
 }
 
 async function markGatewayPaymentFailed({
@@ -179,6 +226,15 @@ async function finalizeSuccessfulGatewayPayment({
       );
 
       if (!updatedUser) throw new Error("USER_NOT_FOUND");
+
+      await createGatewayDepositTransaction({
+        userAfter: updatedUser,
+        creditAmount,
+        gatewayPaymentId: doc._id,
+        gatewayTxnId: txnIdForIdem,
+        client_txn_id: cid,
+        session,
+      });
 
       const gpUpdate = {
         status: "success",

@@ -75,11 +75,6 @@ const createOrder = async (req, res) => {
 
     const amountNum = parsePositiveAmount(amount);
 
-    const cName = sanitizeString(customer_name);
-    const cEmail = sanitizeString(customer_email);
-    const cMobile = sanitizeString(customer_mobile);
-    const pInfo = sanitizeString(p_info || "");
-
     if (amountNum === null) {
       return errorHandler({
         res,
@@ -88,25 +83,29 @@ const createOrder = async (req, res) => {
       });
     }
 
-    if (!cName || !cEmail || !cMobile || !pInfo) {
+    if (amountNum < 10) {
       return errorHandler({
         res,
         statusCode: 400,
-        message:
-          "customer_name, customer_email, customer_mobile and p_info are required",
-      });
-    }
-
-    const normalizedUserId = sanitizeString(userId);
-    if (!normalizedUserId || !mongoose.Types.ObjectId.isValid(normalizedUserId)) {
-      return errorHandler({
-        res,
-        statusCode: 400,
-        message: "userId must be a valid ObjectId string",
+        message: "Minimum add cash amount is 10",
       });
     }
 
     const tokenUid = sanitizeString(req.user && req.user._id);
+    const bodyUserId = sanitizeString(userId);
+    const normalizedUserId =
+      req.user.role === "admin" && bodyUserId
+        ? bodyUserId
+        : tokenUid;
+
+    if (!normalizedUserId || !mongoose.Types.ObjectId.isValid(normalizedUserId)) {
+      return errorHandler({
+        res,
+        statusCode: 400,
+        message: "Valid authenticated user required",
+      });
+    }
+
     if (
       tokenUid &&
       normalizedUserId &&
@@ -120,15 +119,34 @@ const createOrder = async (req, res) => {
       });
     }
 
-    const userExists = await User.exists({
-      _id: normalizedUserId,
-      isActive: true,
-    });
-    if (!userExists) {
+    const payer = await User.findOne(
+      { _id: normalizedUserId, isActive: true },
+      { name: 1, email: 1, mobileNo: 1 }
+    ).lean();
+
+    if (!payer) {
       return errorHandler({
         res,
         statusCode: 404,
         message: "User not found or inactive",
+      });
+    }
+
+    const cName =
+      sanitizeString(customer_name) || payer.name || "Wallet User";
+    const cMobile =
+      sanitizeString(customer_mobile) || payer.mobileNo || "";
+    const cEmail =
+      sanitizeString(customer_email) ||
+      payer.email ||
+      (cMobile ? `${cMobile}@wallet.local` : "wallet@local.invalid");
+    const pInfo = sanitizeString(p_info || "") || "Wallet Add Cash";
+
+    if (!cMobile || !/^\d{10}$/.test(cMobile)) {
+      return errorHandler({
+        res,
+        statusCode: 400,
+        message: "Valid 10-digit customer_mobile is required on user profile",
       });
     }
 

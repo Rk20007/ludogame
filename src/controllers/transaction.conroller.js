@@ -29,7 +29,7 @@ exports.createTransaction = async (req, res) => {
         message: getMessage("M056"),
       });
     }
-      if (Number(amount) < 10 && type === "deposit") {
+      if (Number(amount) < 1 && type === "deposit") {
       return errorHandler({
         res,
         statusCode: 400,
@@ -212,11 +212,25 @@ exports.transactionResponse = async (req, res) => {
 
     if (isApproved) {
       if (data.type === "deposit") {
+        if (data.isGatewayDeposit) {
+          return errorHandler({
+            res,
+            statusCode: 400,
+            message: "Gateway deposits are already credited automatically",
+          });
+        }
         user.balance.totalBalance = user.balance.totalBalance + data.amount;
         user.balance.totalWalletBalance =
           user.balance.totalWalletBalance + data.amount;
       }
     } else {
+      if (data.isGatewayDeposit && data.type === "deposit") {
+        return errorHandler({
+          res,
+          statusCode: 400,
+          message: "Gateway deposits cannot be rejected after payment success",
+        });
+      }
       if (data.type === "withdraw") {
         user.balance.cashWon = user.balance.cashWon + data.amount;
         user.balance.totalWalletBalance =

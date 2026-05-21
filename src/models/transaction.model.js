@@ -41,8 +41,22 @@ const transactionSchema = new Schema(
     screenShot: { type: String, default: null },
     adminUPIId: { type: String, default: null },
     closingBalance: { type: Number, default: 0 },
+    /** EKQR / UPI gateway auto-deposit (credited on webhook or check-status) */
+    isGatewayDeposit: { type: Boolean, default: false, index: true },
+    gatewayPaymentId: {
+      type: Schema.Types.ObjectId,
+      ref: "GatewayPayment",
+      default: null,
+      sparse: true,
+    },
+    gatewayClientTxnId: { type: String, default: null, trim: true, sparse: true },
   },
   { timestamps: true }
+);
+
+transactionSchema.index(
+  { gatewayPaymentId: 1 },
+  { unique: true, sparse: true }
 );
 
 transactionSchema.pre("save", async function (next) {
