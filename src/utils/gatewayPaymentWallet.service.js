@@ -160,7 +160,6 @@ async function approvePendingGatewayRecharge({
   if (existing?.status === "approved") return existing;
 
   const mobile = buildUserDetails(userAfter).mobileNo;
-  const isGatewayAuto = !approvedBy;
 
   const [created] = await Transaction.create(
     [
