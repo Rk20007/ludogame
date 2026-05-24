@@ -59,30 +59,94 @@ function stringifyWebhookPayload(body) {
   return out;
 }
 
+function buildUserDetails(user) {
+  const mobile =
+    typeof user.mobileNo === "string" && user.mobileNo.trim()
+      ? user.mobileNo.trim()
+      : "0000000000";
+  return {
+    name: user.name || "User",
+    mobileNo: mobile,
+  };
+}
+
 /**
- * Admin + user history: one approved deposit row per gateway payment.
+ * When user starts gateway recharge — show as pending in admin until paid or admin approves.
  */
-async function createGatewayDepositTransaction({
-  userAfter,
-  creditAmount,
+async function createPendingGatewayRecharge({
+  userId,
+  amount,
+  gatewayPaymentId,
+  client_txn_id,
+  userSnapshot,
+}) {
+  const exists = await Transaction.findOne({ gatewayPaymentId }).lean();
+  if (exists) return exists;
+
+  const user =
+    userSnapshot ||
+    (await User.findById(userId, {
+      name: 1,
+      mobileNo: 1,
+      balance: 1,
+    }).lean());
+
+  if (!user) throw new Error("USER_NOT_FOUND");
+
+  const [txn] = await Transaction.create([
+    {
+      userId,
+      type: "deposit",
+      amount,
+      status: "pending",
+      isGatewayDeposit: true,
+      gatewayPaymentId,
+      gatewayClientTxnId: client_txn_id || undefined,
+      paymentMethod: "upi",
+      userDetails: buildUserDetails(user),
+      closingBalance: user.balance?.totalWalletBalance ?? 0,
+    },
+  ]);
+
+  return txn;
+}
+
+/**
+ * Approve pending recharge row and set UTR after settlement.
+ */
+async function approvePendingGatewayRecharge({
   gatewayPaymentId,
   gatewayTxnId,
   client_txn_id,
+  userAfter,
+  creditAmount,
+  approvedBy,
   session,
 }) {
-  if (!userAfter || !gatewayPaymentId) return;
+  const update = {
+    status: "approved",
+    closingBalance: userAfter.balance?.totalWalletBalance ?? 0,
+    ...(approvedBy ? { approvedBy } : {}),
+    ...(gatewayTxnId ? { utrNo: gatewayTxnId } : {}),
+    ...(client_txn_id ? { gatewayClientTxnId: client_txn_id } : {}),
+  };
 
-  const exists = await Transaction.findOne({ gatewayPaymentId })
+  const txn = await Transaction.findOneAndUpdate(
+    { gatewayPaymentId, status: "pending" },
+    update,
+    { session, new: true }
+  );
+
+  if (txn) return txn;
+
+  const existing = await Transaction.findOne({ gatewayPaymentId })
     .session(session)
     .lean();
-  if (exists) return;
 
-  const mobile =
-    typeof userAfter.mobileNo === "string" && userAfter.mobileNo.trim()
-      ? userAfter.mobileNo.trim()
-      : "0000000000";
+  if (existing?.status === "approved") return existing;
 
-  await Transaction.create(
+  const mobile = buildUserDetails(userAfter).mobileNo;
+  const [created] = await Transaction.create(
     [
       {
         userId: userAfter._id,
@@ -92,17 +156,42 @@ async function createGatewayDepositTransaction({
         isGatewayDeposit: true,
         gatewayPaymentId,
         gatewayClientTxnId: client_txn_id || undefined,
-        utrNo: gatewayTxnId,
+        utrNo: gatewayTxnId || undefined,
         paymentMethod: "upi",
         userDetails: {
           name: userAfter.name || "User",
           mobileNo: mobile,
         },
         closingBalance: userAfter.balance?.totalWalletBalance ?? 0,
+        ...(approvedBy ? { approvedBy } : {}),
       },
     ],
     { session, ordered: true }
   );
+
+  return created;
+}
+
+async function creditUserWallet({ userId, creditAmount, session }) {
+  await Wallet.findOneAndUpdate(
+    { userId },
+    { $inc: { balance: creditAmount } },
+    { upsert: true, session, new: true, setDefaultsOnInsert: true }
+  );
+
+  const updatedUser = await User.findByIdAndUpdate(
+    userId,
+    {
+      $inc: {
+        "balance.totalBalance": creditAmount,
+        "balance.totalWalletBalance": creditAmount,
+      },
+    },
+    { session, new: true }
+  );
+
+  if (!updatedUser) throw new Error("USER_NOT_FOUND");
+  return updatedUser;
 }
 
 async function markGatewayPaymentFailed({
@@ -133,6 +222,79 @@ async function markGatewayPaymentFailed({
     new: true,
     runValidators: true,
   });
+}
+
+/**
+ * Credit wallet + approve linked pending recharge (gateway success or admin approve).
+ *
+ * @returns {Promise<'credited' | 'already_credited'>}
+ */
+async function settleGatewayRecharge({
+  userId,
+  gatewayPaymentId,
+  gatewayTxnId,
+  client_txn_id,
+  webhookPayload,
+  approvedBy,
+  session,
+}) {
+  const doc = await GatewayPayment.findById(gatewayPaymentId).session(session);
+  if (!doc) throw new Error("GATEWAY_PAYMENT_NOT_FOUND");
+
+  const creditAmount = typeof doc.amount === "number" ? doc.amount : 0;
+  if (!creditAmount || creditAmount <= 0) throw new Error("INVALID_AMOUNT");
+
+  const cid = doc.client_txn_id ? String(doc.client_txn_id).trim() : "";
+
+  if (doc.walletCredited) {
+    const user = await User.findById(userId).session(session);
+    if (user) {
+      await approvePendingGatewayRecharge({
+        gatewayPaymentId: doc._id,
+        gatewayTxnId: gatewayTxnId || doc.txn_id,
+        client_txn_id: cid || client_txn_id,
+        userAfter: user,
+        creditAmount,
+        approvedBy,
+        session,
+      });
+    }
+    return "already_credited";
+  }
+
+  const updatedUser = await creditUserWallet({
+    userId,
+    creditAmount,
+    session,
+  });
+
+  await approvePendingGatewayRecharge({
+    gatewayPaymentId: doc._id,
+    gatewayTxnId: gatewayTxnId || doc.txn_id,
+    client_txn_id: cid || client_txn_id,
+    userAfter: updatedUser,
+    creditAmount,
+    approvedBy,
+    session,
+  });
+
+  const gpUpdate = {
+    status: "success",
+    walletCredited: true,
+    failureReason: null,
+    ...(gatewayTxnId ? { txn_id: gatewayTxnId } : {}),
+  };
+
+  if (webhookPayload !== undefined && webhookPayload !== null) {
+    gpUpdate.webhookPayload = webhookPayload;
+  }
+
+  await GatewayPayment.findByIdAndUpdate(doc._id, gpUpdate, {
+    session,
+    runValidators: true,
+  });
+
+  return "credited";
 }
 
 /**
@@ -176,12 +338,8 @@ async function finalizeSuccessfulGatewayPayment({
     return "missing_txn_id";
   }
 
-  const creditAmount = typeof doc.amount === "number" ? doc.amount : 0;
-  if (!creditAmount || creditAmount <= 0) {
-    await GatewayPayment.findByIdAndUpdate(doc._id, {
-      failureReason: "invalid_stored_amount",
-    }).catch(() => {});
-    return "missing_row";
+  if (doc.walletCredited) {
+    return "duplicate";
   }
 
   const cid = doc.client_txn_id ? String(doc.client_txn_id).trim() : "";
@@ -197,7 +355,7 @@ async function finalizeSuccessfulGatewayPayment({
               txn_id: txnIdForIdem,
               client_txn_id: cid || undefined,
               userId,
-              amountCredited: creditAmount,
+              amountCredited: doc.amount,
               gatewayPaymentId: doc._id,
             },
           ],
@@ -208,56 +366,24 @@ async function finalizeSuccessfulGatewayPayment({
         throw e;
       }
 
-      await Wallet.findOneAndUpdate(
-        { userId },
-        { $inc: { balance: creditAmount } },
-        { upsert: true, session, new: true, setDefaultsOnInsert: true }
-      );
-
-      const updatedUser = await User.findByIdAndUpdate(
+      const outcome = await settleGatewayRecharge({
         userId,
-        {
-          $inc: {
-            "balance.totalBalance": creditAmount,
-            "balance.totalWalletBalance": creditAmount,
-          },
-        },
-        { session, new: true }
-      );
-
-      if (!updatedUser) throw new Error("USER_NOT_FOUND");
-
-      await createGatewayDepositTransaction({
-        userAfter: updatedUser,
-        creditAmount,
         gatewayPaymentId: doc._id,
         gatewayTxnId: txnIdForIdem,
         client_txn_id: cid,
+        webhookPayload,
         session,
       });
 
-      const gpUpdate = {
-        status: "success",
-        walletCredited: true,
-        txn_id: txnIdForIdem,
-        failureReason: null,
-      };
-
-      if (webhookPayload !== undefined && webhookPayload !== null) {
-        gpUpdate.webhookPayload = webhookPayload;
+      if (outcome === "already_credited") {
+        throw new Error("DUPLICATE_GATEWAY_PAYMENT");
       }
-
-      await GatewayPayment.findByIdAndUpdate(doc._id, gpUpdate, {
-        session,
-        runValidators: true,
-      });
     });
   } catch (error) {
     const msg = error instanceof Error ? error.message : String(error);
     if (msg === "DUPLICATE_GATEWAY_PAYMENT") {
       await GatewayPayment.findByIdAndUpdate(doc._id, {
         status: "duplicate",
-        walletCredited: false,
         failureReason: `duplicate_txn_${String(sourceTag).replace(/\W/g, "_")}`,
         ...(webhookPayload !== undefined && webhookPayload !== null
           ? { webhookPayload }
@@ -289,9 +415,71 @@ async function finalizeSuccessfulGatewayPayment({
   return "credited";
 }
 
+/**
+ * Admin manually approves incomplete gateway recharge (pending row).
+ */
+async function adminApproveGatewayRecharge({
+  transactionId,
+  approvedBy,
+}) {
+  const txn = await Transaction.findOne({
+    _id: transactionId,
+    status: "pending",
+    type: "deposit",
+    isGatewayDeposit: true,
+  });
+
+  if (!txn) return { ok: false, reason: "not_found_or_not_pending" };
+
+  const session = await mongoose.startSession();
+
+  try {
+    let result = "credited";
+    await session.withTransaction(async () => {
+      const gp = await GatewayPayment.findById(txn.gatewayPaymentId).session(
+        session
+      );
+
+      if (!gp) throw new Error("GATEWAY_PAYMENT_NOT_FOUND");
+
+      if (gp.walletCredited) {
+        const user = await User.findById(txn.userId).session(session);
+        if (user) {
+          await approvePendingGatewayRecharge({
+            gatewayPaymentId: gp._id,
+            gatewayTxnId: gp.txn_id,
+            client_txn_id: gp.client_txn_id,
+            userAfter: user,
+            creditAmount: txn.amount,
+            approvedBy,
+            session,
+          });
+        }
+        result = "already_credited";
+        return;
+      }
+
+      await settleGatewayRecharge({
+        userId: txn.userId,
+        gatewayPaymentId: gp._id,
+        gatewayTxnId: gp.txn_id || txn.utrNo,
+        client_txn_id: gp.client_txn_id,
+        approvedBy,
+        session,
+      });
+    });
+
+    return { ok: true, result };
+  } finally {
+    await session.endSession();
+  }
+}
+
 module.exports = {
   validateEkqrWebhookKey,
   stringifyWebhookPayload,
   markGatewayPaymentFailed,
   finalizeSuccessfulGatewayPayment,
+  createPendingGatewayRecharge,
+  adminApproveGatewayRecharge,
 };

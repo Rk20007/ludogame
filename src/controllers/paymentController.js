@@ -22,6 +22,7 @@ const {
   stringifyWebhookPayload,
   markGatewayPaymentFailed,
   finalizeSuccessfulGatewayPayment,
+  createPendingGatewayRecharge,
 } = require("../utils/gatewayPaymentWallet.service");
 
 function parsePositiveAmount(raw) {
@@ -240,13 +241,32 @@ const createOrder = async (req, res) => {
       rawResponse: upstream?.data ?? null,
     });
 
+    let pendingRecharge = null;
+    try {
+      pendingRecharge = await createPendingGatewayRecharge({
+        userId: normalizedUserId,
+        amount: amountNum,
+        gatewayPaymentId: gp._id,
+        client_txn_id,
+        userSnapshot: payer,
+      });
+    } catch (pendingErr) {
+      console.error("[EKQR] pending recharge row error:", pendingErr);
+    }
+
     console.log("[EKQR] create-order ok", client_txn_id);
 
     return successHandler({
       res,
       statusCode: 201,
       message: "Payment order created",
-      data: { payment_url, order_id, client_txn_id },
+      data: {
+        payment_url,
+        order_id,
+        client_txn_id,
+        transactionId: pendingRecharge?._id ?? null,
+        rechargeStatus: "pending",
+      },
     });
   } catch (e) {
     console.error("[EKQR] create-order error:", e);

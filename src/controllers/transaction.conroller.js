@@ -2,8 +2,12 @@ const Battle = require("../models/battle.model");
 const Settings = require("../models/settings.model");
 const Transaction = require("../models/transaction.model");
 const User = require("../models/user.model");
+const { GatewayPayment } = require("../models/gatewayPayment.model");
 const getMessage = require("../utils/message");
 const { successHandler, errorHandler } = require("../utils/responseHandler");
+const {
+  adminApproveGatewayRecharge,
+} = require("../utils/gatewayPaymentWallet.service");
 
 // Create Transaction
 exports.createTransaction = async (req, res) => {
@@ -202,6 +206,59 @@ exports.transactionResponse = async (req, res) => {
         message: getMessage("M045"),
       });
     }
+    if (
+      !isApproved &&
+      transactionDetails.type === "deposit" &&
+      transactionDetails.isGatewayDeposit
+    ) {
+      const data = await Transaction.findOneAndUpdate(
+        { _id: transactionId },
+        { status: "rejected", approvedBy: _id },
+        { new: true }
+      );
+
+      if (transactionDetails.gatewayPaymentId) {
+        await GatewayPayment.findByIdAndUpdate(
+          transactionDetails.gatewayPaymentId,
+          {
+            status: "failed",
+            failureReason: "admin_rejected_pending_recharge",
+          }
+        ).catch(() => {});
+      }
+
+      return successHandler({
+        res,
+        statusCode: 200,
+        message: getMessage(message),
+      });
+    }
+
+    if (
+      isApproved &&
+      transactionDetails.type === "deposit" &&
+      transactionDetails.isGatewayDeposit
+    ) {
+      const gatewayResult = await adminApproveGatewayRecharge({
+        transactionId,
+        approvedBy: _id,
+      });
+
+      if (!gatewayResult.ok) {
+        return errorHandler({
+          res,
+          statusCode: 400,
+          message: getMessage("M045"),
+        });
+      }
+
+      return successHandler({
+        res,
+        statusCode: 200,
+        message: getMessage(message),
+      });
+    }
+
     const data = await Transaction.findOneAndUpdate(
       { _id: transactionId },
       { status: isApprovedKey, approvedBy: _id },
@@ -212,25 +269,11 @@ exports.transactionResponse = async (req, res) => {
 
     if (isApproved) {
       if (data.type === "deposit") {
-        if (data.isGatewayDeposit) {
-          return errorHandler({
-            res,
-            statusCode: 400,
-            message: "Gateway deposits are already credited automatically",
-          });
-        }
         user.balance.totalBalance = user.balance.totalBalance + data.amount;
         user.balance.totalWalletBalance =
           user.balance.totalWalletBalance + data.amount;
       }
     } else {
-      if (data.isGatewayDeposit && data.type === "deposit") {
-        return errorHandler({
-          res,
-          statusCode: 400,
-          message: "Gateway deposits cannot be rejected after payment success",
-        });
-      }
       if (data.type === "withdraw") {
         user.balance.cashWon = user.balance.cashWon + data.amount;
         user.balance.totalWalletBalance =
