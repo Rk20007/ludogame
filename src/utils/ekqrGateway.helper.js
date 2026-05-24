@@ -117,6 +117,31 @@ function isGatewaySuccess(raw) {
   );
 }
 
+/** True if EKQR check_order / webhook payload indicates payment success. */
+function isCheckoutSuccessful(extracted, rawData) {
+  if (extracted && isGatewaySuccess(extracted.status)) return true;
+
+  const { merged } = unwrapPayload(rawData);
+  if (merged.success === true) return true;
+  if (normalizeStatus(merged.success) === "true") return true;
+
+  return (
+    isGatewaySuccess(merged.status) ||
+    isGatewaySuccess(merged.payment_status) ||
+    isGatewaySuccess(merged.txn_status) ||
+    isGatewaySuccess(merged.state)
+  );
+}
+
+/** DD-MM-YYYY for EKQR check_order_status (order creation date). */
+function formatTxnDate(date) {
+  const d = date instanceof Date ? date : new Date(date);
+  const dd = String(d.getDate()).padStart(2, "0");
+  const mm = String(d.getMonth() + 1).padStart(2, "0");
+  const yyyy = d.getFullYear();
+  return `${dd}-${mm}-${yyyy}`;
+}
+
 async function ekqrPost(url, payload) {
   return axios.post(url, payload, {
     timeout: getEkqrHttpTimeoutMs(),
@@ -145,4 +170,7 @@ module.exports = {
   extractCheckOrder,
   normalizeStatus,
   isGatewaySuccess,
+  isCheckoutSuccessful,
+  formatTxnDate,
+  unwrapPayload,
 };

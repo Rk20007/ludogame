@@ -15,8 +15,9 @@ const {
   extractCreateOrder,
   extractEkqrUpstreamMessage,
   extractCheckOrder,
-  normalizeStatus,
   isGatewaySuccess,
+  isCheckoutSuccessful,
+  formatTxnDate,
 } = require("../utils/ekqrGateway.helper");
 const {
   validateEkqrWebhookKey,
@@ -45,6 +46,40 @@ function validateTxnDate(s) {
 function sanitizeString(v) {
   if (typeof v !== "string") return "";
   return v.trim();
+}
+
+function resolveGatewayTxnId(extracted, gp, client_txn_id) {
+  const fromApi =
+    extracted?.txn_id && String(extracted.txn_id).trim()
+      ? String(extracted.txn_id).trim()
+      : "";
+  const fromGp =
+    gp?.txn_id && String(gp.txn_id).trim() ? String(gp.txn_id).trim() : "";
+  const cid = sanitizeString(client_txn_id) || sanitizeString(gp?.client_txn_id);
+  if (fromApi) return fromApi;
+  if (fromGp) return fromGp;
+  if (cid) return `client_${cid}`;
+  return "";
+}
+
+async function buildSettlementPayload(gp, client_txn_id, outcome, extra = {}) {
+  const refreshed = await GatewayPayment.findOne({ client_txn_id }).lean();
+  const settledTxn = await Transaction.findOne({ gatewayPaymentId: gp._id })
+    .select("status isAutoApproved approvalSource")
+    .lean();
+  const user = await User.findById(gp.userId, { balance: 1 }).lean();
+
+  return {
+    client_txn_id,
+    reconciliation: outcome,
+    txn_id: refreshed?.txn_id ?? null,
+    walletCredited: refreshed?.walletCredited ?? false,
+    transactionStatus: settledTxn?.status ?? null,
+    isAutoApproved: settledTxn?.isAutoApproved ?? false,
+    approvalSource: settledTxn?.approvalSource ?? null,
+    userWalletBalance: user?.balance?.totalWalletBalance ?? null,
+    ...extra,
+  };
 }
 
 /**
@@ -124,7 +159,7 @@ const createOrder = async (req, res) => {
 
     const payer = await User.findOne(
       { _id: normalizedUserId, isActive: true },
-      { name: 1, email: 1, mobileNo: 1 }
+      { name: 1, email: 1, mobileNo: 1, balance: 1 }
     ).lean();
 
     if (!payer) {
@@ -283,9 +318,10 @@ const createOrder = async (req, res) => {
 
 /**
  * POST /api/payment/check-status
+ * POST /api/payment/reconcile (same logic — txn_date optional, defaults to order date)
  */
-const checkOrderStatus = async (req, res) => {
-  console.log("[EKQR] check-status");
+async function runGatewayCheckAndSettle(req, res) {
+  console.log("[EKQR] check-status / reconcile");
   try {
     const apiKey = getEkqrApiKey();
     if (!apiKey) {
@@ -298,7 +334,6 @@ const checkOrderStatus = async (req, res) => {
     }
 
     const client_txn_id = sanitizeString((req.body && req.body.client_txn_id) || "");
-    const txn_date = validateTxnDate((req.body && req.body.txn_date) || "");
 
     if (!client_txn_id) {
       return errorHandler({
@@ -308,21 +343,13 @@ const checkOrderStatus = async (req, res) => {
       });
     }
 
-    if (!txn_date) {
-      return errorHandler({
-        res,
-        statusCode: 400,
-        message: "txn_date is required in DD-MM-YYYY format",
-      });
-    }
-
     const gp = await GatewayPayment.findOne({ client_txn_id }).lean();
 
     if (!gp) {
       return errorHandler({
         res,
         statusCode: 404,
-        message: "Unknown client_txn_id",
+        message: "Unknown client_txn_id — create-order must be called on this same API server first",
       });
     }
 
@@ -341,6 +368,21 @@ const checkOrderStatus = async (req, res) => {
         message: "Forbidden: cannot inspect another user's payment",
       });
     }
+
+    if (gp.walletCredited) {
+      const data = await buildSettlementPayload(gp, client_txn_id, "duplicate");
+      return successHandler({
+        res,
+        statusCode: 200,
+        message: "Payment already settled — wallet and admin recharge are up to date",
+        data,
+      });
+    }
+
+    const txn_date =
+      validateTxnDate((req.body && req.body.txn_date) || "") ||
+      validateTxnDate(gp.txn_date || "") ||
+      formatTxnDate(gp.createdAt ? new Date(gp.createdAt) : new Date());
 
     const payload = { key: apiKey, client_txn_id, txn_date };
 
@@ -375,6 +417,16 @@ const checkOrderStatus = async (req, res) => {
     }
 
     const extracted = extractCheckOrder(upstream.data);
+    const checkoutOk = isCheckoutSuccessful(extracted, upstream.data);
+
+    console.log(
+      "[EKQR] check-status upstream status=",
+      extracted.status,
+      "checkoutOk=",
+      checkoutOk,
+      "txn_date=",
+      txn_date
+    );
 
     await GatewayPayment.findOneAndUpdate(
       { client_txn_id },
@@ -386,50 +438,42 @@ const checkOrderStatus = async (req, res) => {
       }
     ).catch(() => {});
 
-    if (isGatewaySuccess(extracted.status)) {
-      const gwTxn =
-        (extracted.txn_id && String(extracted.txn_id).trim()) ||
-        (gp.txn_id && String(gp.txn_id).trim()) ||
-        "";
+    if (checkoutOk) {
+      const gwTxn = resolveGatewayTxnId(extracted, gp, client_txn_id);
 
-      if (!gwTxn) {
-        console.error("[EKQR] success without txn_id:", upstream?.data);
-        await markGatewayPaymentFailed({
+      let outcome = "failed";
+      try {
+        outcome = await finalizeSuccessfulGatewayPayment({
+          userId: gp.userId,
           gatewayPaymentId: gp._id,
+          client_txn_id,
+          gatewayTxnId: gwTxn,
           webhookPayload: { check_order: upstream.data },
-          reason: "check_status_missing_txn_id",
-        }).catch(() => {});
-
-        return successHandler({
-          res,
-          statusCode: 200,
-          message: "Gateway indicates success but txn_id missing — not credited",
-          data: {
-            client_txn_id,
-            reconciliation: "failed",
-            upstream: upstream.data,
-          },
+          sourceTag: "[check_status]",
         });
+      } catch (settleErr) {
+        console.error("[EKQR] settle threw:", settleErr);
+        outcome = "failed";
       }
-
-      const outcome = await finalizeSuccessfulGatewayPayment({
-        userId: gp.userId,
-        gatewayPaymentId: gp._id,
-        client_txn_id,
-        gatewayTxnId: gwTxn,
-        webhookPayload: { check_order: upstream.data },
-        sourceTag: "[check_status]",
-      });
 
       console.log("[EKQR] check-status outcome:", outcome);
 
-      const refreshed = await GatewayPayment.findOne({ client_txn_id }).lean();
+      const data = await buildSettlementPayload(gp, client_txn_id, outcome, {
+        gatewayStatus: extracted.status,
+        txn_date,
+      });
 
-      const settledTxn = await Transaction.findOne({
-        gatewayPaymentId: gp._id,
-      })
-        .select("status isAutoApproved approvalSource")
-        .lean();
+      if (outcome !== "credited" && outcome !== "duplicate") {
+        return successHandler({
+          res,
+          statusCode: 200,
+          message:
+            "Gateway reports success but wallet was not updated — check server logs (reconciliation: " +
+            outcome +
+            ")",
+          data,
+        });
+      }
 
       return successHandler({
         res,
@@ -437,17 +481,8 @@ const checkOrderStatus = async (req, res) => {
         message:
           outcome === "credited"
             ? "Payment successful — wallet updated and recharge auto-approved"
-            : "Payment status processed",
-        data: {
-          client_txn_id,
-          reconciliation: outcome,
-          txn_id: refreshed?.txn_id,
-          gatewayStatus: extracted.status,
-          walletCredited: refreshed?.walletCredited ?? false,
-          transactionStatus: settledTxn?.status ?? null,
-          isAutoApproved: settledTxn?.isAutoApproved ?? false,
-          approvalSource: settledTxn?.approvalSource ?? null,
-        },
+            : "Payment already settled",
+        data,
       });
     }
 
@@ -457,7 +492,7 @@ const checkOrderStatus = async (req, res) => {
       reason: "check_status_gateway_not_success",
     }).catch(() => {});
 
-    console.log("[EKQR] check-status gateway not successful");
+    console.log("[EKQR] check-status gateway not successful:", extracted.status);
 
     return successHandler({
       res,
@@ -467,6 +502,7 @@ const checkOrderStatus = async (req, res) => {
         client_txn_id,
         reconciliation: "failed",
         gatewayStatus: extracted.status,
+        txn_date,
       },
     });
   } catch (e) {
@@ -474,10 +510,13 @@ const checkOrderStatus = async (req, res) => {
     return errorHandler({
       res,
       statusCode: 500,
-      message: "Internal server error",
+      message: e instanceof Error ? e.message : "Internal server error",
     });
   }
-};
+}
+
+const checkOrderStatus = runGatewayCheckAndSettle;
+const reconcilePayment = runGatewayCheckAndSettle;
 
 /**
  * POST /api/transaction/wallet/verify/upi
@@ -559,20 +598,26 @@ const upiWebhook = async (req, res) => {
       return res.status(200).json({ success: true });
     }
 
-    const outcome = await finalizeSuccessfulGatewayPayment({
-      userId: gp.userId,
-      gatewayPaymentId: gp._id,
-      client_txn_id,
-      gatewayTxnId: txn_id,
-      webhookPayload: rawBody,
-      sourceTag: "[webhook]",
-    });
+    const gwTxn =
+      txn_id || resolveGatewayTxnId({ txn_id }, gp, client_txn_id);
 
-    if (outcome === "duplicate") console.log("Duplicate Transaction");
-    else if (outcome === "credited") console.log("Payment Success");
-    else console.log("Payment Failed");
+    let outcome = "failed";
+    try {
+      outcome = await finalizeSuccessfulGatewayPayment({
+        userId: gp.userId,
+        gatewayPaymentId: gp._id,
+        client_txn_id,
+        gatewayTxnId: gwTxn,
+        webhookPayload: rawBody,
+        sourceTag: "[webhook]",
+      });
+    } catch (settleErr) {
+      console.error("[EKQR Webhook] settle error:", settleErr);
+    }
 
-    return res.status(200).json({ success: true });
+    console.log("[EKQR Webhook] outcome:", outcome);
+
+    return res.status(200).json({ success: true, reconciliation: outcome });
   } catch (e) {
     console.error("[EKQR Webhook] unhandled:", e);
     return res.status(200).json({ success: true });
@@ -582,5 +627,6 @@ const upiWebhook = async (req, res) => {
 module.exports = {
   createOrder,
   checkOrderStatus,
+  reconcilePayment,
   upiWebhook,
 };

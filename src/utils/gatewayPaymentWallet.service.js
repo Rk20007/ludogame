@@ -340,9 +340,10 @@ async function settleGatewayRecharge({
   if (!creditAmount || creditAmount <= 0) throw new Error("INVALID_AMOUNT");
 
   const cid = doc.client_txn_id ? String(doc.client_txn_id).trim() : "";
+  const payUserId = doc.userId || userId;
 
   if (doc.walletCredited) {
-    let userQuery = User.findById(userId);
+    let userQuery = User.findById(payUserId);
     if (session) userQuery = userQuery.session(session);
     const user = await userQuery;
     if (user) {
@@ -360,7 +361,7 @@ async function settleGatewayRecharge({
   }
 
   const updatedUser = await creditUserWallet({
-    userId,
+    userId: payUserId,
     creditAmount,
     session,
   });
@@ -423,10 +424,11 @@ async function reconcileSuccessfulGatewayPayment({
     return "missing_row";
   }
 
+  const cid = doc.client_txn_id ? String(doc.client_txn_id).trim() : "";
+
   const txnIdForIdem =
-    gatewayTxnId && String(gatewayTxnId).trim()
-      ? String(gatewayTxnId).trim()
-      : "";
+    (gatewayTxnId && String(gatewayTxnId).trim()) ||
+    (cid ? `client_${cid}` : "");
 
   if (!txnIdForIdem) {
     await GatewayPayment.findByIdAndUpdate(doc._id, {
@@ -435,13 +437,15 @@ async function reconcileSuccessfulGatewayPayment({
     return "missing_txn_id";
   }
 
+  const effectiveUserId = doc.userId || userId;
+
   if (doc.walletCredited) {
-    const user = await User.findById(userId);
+    const user = await User.findById(effectiveUserId);
     if (user) {
       await approvePendingGatewayRecharge({
         gatewayPaymentId: doc._id,
         gatewayTxnId: txnIdForIdem,
-        client_txn_id: doc.client_txn_id,
+        client_txn_id: cid,
         userAfter: user,
         creditAmount: doc.amount,
         approvedBy: null,
@@ -451,8 +455,6 @@ async function reconcileSuccessfulGatewayPayment({
     return "duplicate";
   }
 
-  const cid = doc.client_txn_id ? String(doc.client_txn_id).trim() : "";
-
   try {
     await withOptionalTransaction(async (session) => {
       try {
@@ -461,7 +463,7 @@ async function reconcileSuccessfulGatewayPayment({
             {
               txn_id: txnIdForIdem,
               client_txn_id: cid || undefined,
-              userId,
+              userId: effectiveUserId,
               amountCredited: doc.amount,
               gatewayPaymentId: doc._id,
             },
@@ -474,7 +476,7 @@ async function reconcileSuccessfulGatewayPayment({
       }
 
       const outcome = await settleGatewayRecharge({
-        userId,
+        userId: effectiveUserId,
         gatewayPaymentId: doc._id,
         gatewayTxnId: txnIdForIdem,
         client_txn_id: cid,
