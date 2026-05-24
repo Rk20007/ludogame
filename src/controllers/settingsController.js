@@ -420,6 +420,10 @@ exports.adminDashboard = async (req, res) => {
       getCount(Transaction, {
         status: "pending",
         type: "deposit",
+        $or: [
+          { isGatewayDeposit: { $ne: true } },
+          { isGatewayDeposit: true, gatewayAwaitingPayment: { $ne: true } },
+        ],
         ...dateFilter,
       }),
       getCount(Transaction, {

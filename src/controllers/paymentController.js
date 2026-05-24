@@ -3,6 +3,7 @@ const mongoose = require("mongoose");
 const { v4: uuidv4 } = require("uuid");
 
 const User = require("../models/user.model");
+const Transaction = require("../models/transaction.model");
 const { GatewayPayment } = require("../models/gatewayPayment.model");
 const { errorHandler, successHandler } = require("../utils/responseHandler");
 const {
@@ -422,6 +423,12 @@ const checkOrderStatus = async (req, res) => {
 
       const refreshed = await GatewayPayment.findOne({ client_txn_id }).lean();
 
+      const settledTxn = await Transaction.findOne({
+        gatewayPaymentId: gp._id,
+      })
+        .select("status isAutoApproved approvalSource")
+        .lean();
+
       return successHandler({
         res,
         statusCode: 200,
@@ -431,6 +438,9 @@ const checkOrderStatus = async (req, res) => {
           reconciliation: outcome,
           txn_id: refreshed?.txn_id,
           gatewayStatus: extracted.status,
+          transactionStatus: settledTxn?.status ?? null,
+          isAutoApproved: settledTxn?.isAutoApproved ?? false,
+          approvalSource: settledTxn?.approvalSource ?? null,
         },
       });
     }

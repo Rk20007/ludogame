@@ -132,7 +132,7 @@ exports.createTransaction = async (req, res) => {
 exports.getTransactions = async (req, res) => {
   try {
     const { _id, role } = req.user;
-    const { type } = req.query;
+    const { type, status } = req.query;
     const filter = {};
     if (role === "user") {
       filter.userId = _id;
@@ -148,6 +148,25 @@ exports.getTransactions = async (req, res) => {
       }
     } else {
       filter.type = ["deposit", "withdraw", "bonus", "penalty", "referral"];
+    }
+
+    if (status && ["pending", "approved", "rejected"].includes(status)) {
+      filter.status = status;
+    }
+
+    // Admin pending recharge: only incomplete gateway + manual deposits
+    if (
+      role !== "user" &&
+      filter.status === "pending" &&
+      (!type || type === "deposit")
+    ) {
+      filter.$or = [
+        { isGatewayDeposit: { $ne: true } },
+        {
+          isGatewayDeposit: true,
+          gatewayAwaitingPayment: { $ne: true },
+        },
+      ];
     }
 
     const transactionList = await Transaction.find(filter)
@@ -226,6 +245,10 @@ exports.transactionResponse = async (req, res) => {
           }
         ).catch(() => {});
       }
+
+      await Transaction.findByIdAndUpdate(transactionId, {
+        gatewayAwaitingPayment: false,
+      }).catch(() => {});
 
       return successHandler({
         res,

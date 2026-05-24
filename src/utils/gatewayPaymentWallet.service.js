@@ -100,6 +100,7 @@ async function createPendingGatewayRecharge({
       amount,
       status: "pending",
       isGatewayDeposit: true,
+      gatewayAwaitingPayment: true,
       gatewayPaymentId,
       gatewayClientTxnId: client_txn_id || undefined,
       paymentMethod: "upi",
@@ -123,9 +124,22 @@ async function approvePendingGatewayRecharge({
   approvedBy,
   session,
 }) {
+  const isGatewayAuto = !approvedBy;
+
   const update = {
     status: "approved",
+    gatewayAwaitingPayment: false,
     closingBalance: userAfter.balance?.totalWalletBalance ?? 0,
+    ...(isGatewayAuto
+      ? {
+          isAutoApproved: true,
+          approvalSource: "gateway",
+          gatewaySettledAt: new Date(),
+        }
+      : {
+          isAutoApproved: false,
+          approvalSource: "admin",
+        }),
     ...(approvedBy ? { approvedBy } : {}),
     ...(gatewayTxnId ? { utrNo: gatewayTxnId } : {}),
     ...(client_txn_id ? { gatewayClientTxnId: client_txn_id } : {}),
@@ -146,6 +160,8 @@ async function approvePendingGatewayRecharge({
   if (existing?.status === "approved") return existing;
 
   const mobile = buildUserDetails(userAfter).mobileNo;
+  const isGatewayAuto = !approvedBy;
+
   const [created] = await Transaction.create(
     [
       {
@@ -154,6 +170,7 @@ async function approvePendingGatewayRecharge({
         amount: creditAmount,
         status: "approved",
         isGatewayDeposit: true,
+        gatewayAwaitingPayment: false,
         gatewayPaymentId,
         gatewayClientTxnId: client_txn_id || undefined,
         utrNo: gatewayTxnId || undefined,
@@ -163,6 +180,16 @@ async function approvePendingGatewayRecharge({
           mobileNo: mobile,
         },
         closingBalance: userAfter.balance?.totalWalletBalance ?? 0,
+        ...(isGatewayAuto
+          ? {
+              isAutoApproved: true,
+              approvalSource: "gateway",
+              gatewaySettledAt: new Date(),
+            }
+          : {
+              isAutoApproved: false,
+              approvalSource: "admin",
+            }),
         ...(approvedBy ? { approvedBy } : {}),
       },
     ],
@@ -218,10 +245,19 @@ async function markGatewayPaymentFailed({
     update.webhookPayload = webhookPayload;
   }
 
-  return GatewayPayment.findOneAndUpdate(filter, update, {
+  const gp = await GatewayPayment.findOneAndUpdate(filter, update, {
     new: true,
     runValidators: true,
   });
+
+  if (gp?._id) {
+    await Transaction.findOneAndUpdate(
+      { gatewayPaymentId: gp._id, gatewayAwaitingPayment: true },
+      { gatewayAwaitingPayment: false }
+    ).catch(() => {});
+  }
+
+  return gp;
 }
 
 /**

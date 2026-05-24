@@ -50,6 +50,16 @@ const transactionSchema = new Schema(
       sparse: true,
     },
     gatewayClientTxnId: { type: String, default: null, trim: true, sparse: true },
+    /** Hidden from admin pending queue while user is on gateway checkout */
+    gatewayAwaitingPayment: { type: Boolean, default: false },
+    /** Gateway webhook/check-status settled without admin click */
+    isAutoApproved: { type: Boolean, default: false, index: true },
+    approvalSource: {
+      type: String,
+      enum: ["gateway", "admin"],
+      default: null,
+    },
+    gatewaySettledAt: { type: Date, default: null },
   },
   { timestamps: true }
 );
