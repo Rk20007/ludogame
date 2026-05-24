@@ -105,7 +105,16 @@ function normalizeStatus(raw) {
 }
 
 function isGatewaySuccess(raw) {
-  return normalizeStatus(raw) === "success";
+  const s = normalizeStatus(raw);
+  return (
+    s === "success" ||
+    s === "successful" ||
+    s === "completed" ||
+    s === "paid" ||
+    s === "captured" ||
+    s === "1" ||
+    s === "true"
+  );
 }
 
 async function ekqrPost(url, payload) {

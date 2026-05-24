@@ -24,6 +24,7 @@ const {
   markGatewayPaymentFailed,
   finalizeSuccessfulGatewayPayment,
   createPendingGatewayRecharge,
+  appendClientTxnToRedirectUrl,
 } = require("../utils/gatewayPaymentWallet.service");
 
 function parsePositiveAmount(raw) {
@@ -153,10 +154,11 @@ const createOrder = async (req, res) => {
     }
 
     const client_txn_id = `${Date.now()}${uuidv4().replace(/-/g, "").slice(0, 12)}`;
-    const redir =
+    const redirBase =
       typeof redirect_url === "string" && redirect_url.trim()
         ? redirect_url.trim()
         : getDefaultRedirectUrl();
+    const redir = appendClientTxnToRedirectUrl(redirBase, client_txn_id);
 
     const gp = await GatewayPayment.create({
       userId: normalizedUserId,
@@ -432,12 +434,16 @@ const checkOrderStatus = async (req, res) => {
       return successHandler({
         res,
         statusCode: 200,
-        message: "Payment status processed",
+        message:
+          outcome === "credited"
+            ? "Payment successful — wallet updated and recharge auto-approved"
+            : "Payment status processed",
         data: {
           client_txn_id,
           reconciliation: outcome,
           txn_id: refreshed?.txn_id,
           gatewayStatus: extracted.status,
+          walletCredited: refreshed?.walletCredited ?? false,
           transactionStatus: settledTxn?.status ?? null,
           isAutoApproved: settledTxn?.isAutoApproved ?? false,
           approvalSource: settledTxn?.approvalSource ?? null,

@@ -5,6 +5,59 @@ const { GatewayPayment } = require("../models/gatewayPayment.model");
 const Wallet = require("../models/gatewayWallet.model");
 const GatewayPaymentIdempotency = require("../models/gatewayPaymentIdempotency.model");
 
+function sessionOpts(session) {
+  return session ? { session } : {};
+}
+
+function isMongoTransactionUnsupported(error) {
+  const msg = error instanceof Error ? error.message : String(error);
+  return (
+    error?.code === 20 ||
+    /replica set/i.test(msg) ||
+    /Transaction numbers/i.test(msg) ||
+    /multi-document transactions/i.test(msg)
+  );
+}
+
+/**
+ * @template T
+ * @param {(session: import('mongoose').ClientSession | null) => Promise<T>} fn
+ */
+async function withOptionalTransaction(fn) {
+  const session = await mongoose.startSession();
+  try {
+    let result;
+    await session.withTransaction(async () => {
+      result = await fn(session);
+    });
+    return result;
+  } catch (error) {
+    if (isMongoTransactionUnsupported(error)) {
+      console.warn(
+        "[Gateway] MongoDB transactions unavailable — running without session"
+      );
+      return fn(null);
+    }
+    throw error;
+  } finally {
+    await session.endSession();
+  }
+}
+
+/** Append client_txn_id so external frontend can call check-status after redirect. */
+function appendClientTxnToRedirectUrl(baseUrl, client_txn_id) {
+  const base = String(baseUrl || "").trim();
+  if (!base || !client_txn_id) return base;
+  try {
+    const url = new URL(base);
+    url.searchParams.set("client_txn_id", client_txn_id);
+    return url.toString();
+  } catch {
+    const sep = base.includes("?") ? "&" : "?";
+    return `${base}${sep}client_txn_id=${encodeURIComponent(client_txn_id)}`;
+  }
+}
+
 /**
  * @param {{ body: Record<string, unknown>; headers?: import('express').IncomingHttpHeaders }} req
  */
@@ -148,14 +201,14 @@ async function approvePendingGatewayRecharge({
   const txn = await Transaction.findOneAndUpdate(
     { gatewayPaymentId, status: "pending" },
     update,
-    { session, new: true }
+    { ...sessionOpts(session), new: true }
   );
 
   if (txn) return txn;
 
-  const existing = await Transaction.findOne({ gatewayPaymentId })
-    .session(session)
-    .lean();
+  let existingQuery = Transaction.findOne({ gatewayPaymentId });
+  if (session) existingQuery = existingQuery.session(session);
+  const existing = await existingQuery.lean();
 
   if (existing?.status === "approved") return existing;
 
@@ -192,7 +245,7 @@ async function approvePendingGatewayRecharge({
         ...(approvedBy ? { approvedBy } : {}),
       },
     ],
-    { session, ordered: true }
+    { ...sessionOpts(session), ordered: true }
   );
 
   return created;
@@ -202,7 +255,12 @@ async function creditUserWallet({ userId, creditAmount, session }) {
   await Wallet.findOneAndUpdate(
     { userId },
     { $inc: { balance: creditAmount } },
-    { upsert: true, session, new: true, setDefaultsOnInsert: true }
+    {
+      upsert: true,
+      ...sessionOpts(session),
+      new: true,
+      setDefaultsOnInsert: true,
+    }
   );
 
   const updatedUser = await User.findByIdAndUpdate(
@@ -213,7 +271,7 @@ async function creditUserWallet({ userId, creditAmount, session }) {
         "balance.totalWalletBalance": creditAmount,
       },
     },
-    { session, new: true }
+    { ...sessionOpts(session), new: true }
   );
 
   if (!updatedUser) throw new Error("USER_NOT_FOUND");
@@ -273,7 +331,9 @@ async function settleGatewayRecharge({
   approvedBy,
   session,
 }) {
-  const doc = await GatewayPayment.findById(gatewayPaymentId).session(session);
+  let gpQuery = GatewayPayment.findById(gatewayPaymentId);
+  if (session) gpQuery = gpQuery.session(session);
+  const doc = await gpQuery;
   if (!doc) throw new Error("GATEWAY_PAYMENT_NOT_FOUND");
 
   const creditAmount = typeof doc.amount === "number" ? doc.amount : 0;
@@ -282,7 +342,9 @@ async function settleGatewayRecharge({
   const cid = doc.client_txn_id ? String(doc.client_txn_id).trim() : "";
 
   if (doc.walletCredited) {
-    const user = await User.findById(userId).session(session);
+    let userQuery = User.findById(userId);
+    if (session) userQuery = userQuery.session(session);
+    const user = await userQuery;
     if (user) {
       await approvePendingGatewayRecharge({
         gatewayPaymentId: doc._id,
@@ -325,7 +387,7 @@ async function settleGatewayRecharge({
   }
 
   await GatewayPayment.findByIdAndUpdate(doc._id, gpUpdate, {
-    session,
+    ...sessionOpts(session),
     runValidators: true,
   });
 
@@ -333,9 +395,10 @@ async function settleGatewayRecharge({
 }
 
 /**
+ * Gateway success → credit user wallet + auto-approve admin Transaction.
  * @returns {Promise<'credited' | 'duplicate' | 'missing_user_id' | 'missing_row' | 'missing_txn_id'>}
  */
-async function finalizeSuccessfulGatewayPayment({
+async function reconcileSuccessfulGatewayPayment({
   userId,
   gatewayPaymentId,
   client_txn_id,
@@ -356,7 +419,7 @@ async function finalizeSuccessfulGatewayPayment({
   }
 
   if (!doc) {
-    console.error(`${sourceTag} GatewayPayment row not found`);
+    console.error(`${sourceTag} GatewayPayment not found`);
     return "missing_row";
   }
 
@@ -369,20 +432,29 @@ async function finalizeSuccessfulGatewayPayment({
     await GatewayPayment.findByIdAndUpdate(doc._id, {
       failureReason: "missing_txn_id_for_idempotency",
     }).catch(() => {});
-    console.error(`${sourceTag} Missing gateway txn_id`);
     return "missing_txn_id";
   }
 
   if (doc.walletCredited) {
+    const user = await User.findById(userId);
+    if (user) {
+      await approvePendingGatewayRecharge({
+        gatewayPaymentId: doc._id,
+        gatewayTxnId: txnIdForIdem,
+        client_txn_id: doc.client_txn_id,
+        userAfter: user,
+        creditAmount: doc.amount,
+        approvedBy: null,
+        session: null,
+      }).catch(() => {});
+    }
     return "duplicate";
   }
 
   const cid = doc.client_txn_id ? String(doc.client_txn_id).trim() : "";
 
-  const session = await mongoose.startSession();
-
   try {
-    await session.withTransaction(async () => {
+    await withOptionalTransaction(async (session) => {
       try {
         await GatewayPaymentIdempotency.create(
           [
@@ -394,7 +466,7 @@ async function finalizeSuccessfulGatewayPayment({
               gatewayPaymentId: doc._id,
             },
           ],
-          { session, ordered: true }
+          { ...sessionOpts(session), ordered: true }
         );
       } catch (e) {
         if (e && e.code === 11000) throw new Error("DUPLICATE_GATEWAY_PAYMENT");
@@ -417,37 +489,32 @@ async function finalizeSuccessfulGatewayPayment({
   } catch (error) {
     const msg = error instanceof Error ? error.message : String(error);
     if (msg === "DUPLICATE_GATEWAY_PAYMENT") {
-      await GatewayPayment.findByIdAndUpdate(doc._id, {
-        status: "duplicate",
-        failureReason: `duplicate_txn_${String(sourceTag).replace(/\W/g, "_")}`,
-        ...(webhookPayload !== undefined && webhookPayload !== null
-          ? { webhookPayload }
-          : {}),
-      }).catch(() => {});
       return "duplicate";
     }
-
     if (msg === "USER_NOT_FOUND") {
       await GatewayPayment.findByIdAndUpdate(doc._id, {
-        status: "failed",
-        walletCredited: false,
         failureReason: "user_not_found_on_finalize",
       }).catch(() => {});
       return "missing_user_id";
     }
-
+    console.error(`${sourceTag} reconcile failed:`, error);
     await GatewayPayment.findByIdAndUpdate(doc._id, {
-      status: "failed",
-      walletCredited: false,
       failureReason: "finalize_transaction_error",
     }).catch(() => {});
-
     throw error;
-  } finally {
-    await session.endSession();
   }
 
+  console.log(
+    `${sourceTag} OK — user wallet credited, admin transaction auto-approved`
+  );
   return "credited";
+}
+
+/**
+ * @returns {Promise<'credited' | 'duplicate' | 'missing_user_id' | 'missing_row' | 'missing_txn_id'>}
+ */
+async function finalizeSuccessfulGatewayPayment(params) {
+  return reconcileSuccessfulGatewayPayment(params);
 }
 
 /**
@@ -466,19 +533,19 @@ async function adminApproveGatewayRecharge({
 
   if (!txn) return { ok: false, reason: "not_found_or_not_pending" };
 
-  const session = await mongoose.startSession();
-
   try {
     let result = "credited";
-    await session.withTransaction(async () => {
-      const gp = await GatewayPayment.findById(txn.gatewayPaymentId).session(
-        session
-      );
+    await withOptionalTransaction(async (session) => {
+      let gpQuery = GatewayPayment.findById(txn.gatewayPaymentId);
+      if (session) gpQuery = gpQuery.session(session);
+      const gp = await gpQuery;
 
       if (!gp) throw new Error("GATEWAY_PAYMENT_NOT_FOUND");
 
       if (gp.walletCredited) {
-        const user = await User.findById(txn.userId).session(session);
+        let userQuery = User.findById(txn.userId);
+        if (session) userQuery = userQuery.session(session);
+        const user = await userQuery;
         if (user) {
           await approvePendingGatewayRecharge({
             gatewayPaymentId: gp._id,
@@ -505,8 +572,9 @@ async function adminApproveGatewayRecharge({
     });
 
     return { ok: true, result };
-  } finally {
-    await session.endSession();
+  } catch (error) {
+    console.error("[Gateway] adminApproveGatewayRecharge:", error);
+    return { ok: false, reason: "settlement_failed" };
   }
 }
 
@@ -515,6 +583,8 @@ module.exports = {
   stringifyWebhookPayload,
   markGatewayPaymentFailed,
   finalizeSuccessfulGatewayPayment,
+  reconcileSuccessfulGatewayPayment,
   createPendingGatewayRecharge,
   adminApproveGatewayRecharge,
+  appendClientTxnToRedirectUrl,
 };
